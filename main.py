@@ -5,6 +5,7 @@ from typing import Any
 import uvicorn
 from fastapi import FastAPI
 
+from src.app.models import IDConversionRequest, LayerConversionRequest
 from src.conversion.id import handle_id
 from src.conversion.layers import handle_layers
 from src.work.work_queue import get_status
@@ -25,13 +26,13 @@ async def read_root() -> dict[str, str]:
 
 
 @app.post(path="/v1/layers")
-def create_layer() -> dict[str, str]:
-    return handle_layers()
+def create_layer(request: LayerConversionRequest) -> dict[str, str]:
+    return handle_layers(request)
 
 
 @app.post(path="/v1/ids")
-def create_mws() -> dict[str, str]:
-    return handle_id()
+def create_mws(request: IDConversionRequest) -> dict[str, str]:
+    return handle_id(request)
 
 
 @app.get(path="/v1/status")
