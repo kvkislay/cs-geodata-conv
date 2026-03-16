@@ -1,0 +1,46 @@
+services:
+  workers:
+    build:
+      context: .
+      dockerfile: workers.dockerfile
+    develop:
+      watch:
+        - action: rebuild
+          path: pyproject.toml
+        - action: rebuild
+          path: sysconf.ini
+        - action: sync+restart
+          path: .
+          target: /app
+  app:
+    build:
+      context: .
+      dockerfile: app.dockerfile
+    ports:
+      - 8000:80
+    depends_on:
+      workers:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    develop:
+      watch:
+        - action: rebuild
+          path: pyproject.toml
+        - action: sync+restart
+          path: .
+          target: /app
+
+  redis:
+    image: redis:alpine
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  redis-data:

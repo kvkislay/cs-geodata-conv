@@ -12,4 +12,4 @@ RUN uv sync --locked
 # RUN addgroup -S appgroup && adduser -S -D -G appgroup appuser
 # USER app
 
-CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80"]
+CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80", "--reload"]
