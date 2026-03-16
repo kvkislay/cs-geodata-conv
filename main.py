@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from src.app.models import IDConversionRequest, LayerConversionRequest
 from src.conversion.id import handle_id
 from src.conversion.layers import handle_layers
+from src.utils.checks import check_redis_connection, check_worker_status
 from src.work.work_queue import get_status
 
 app = FastAPI()
@@ -22,7 +23,31 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, Any]:
 
 @app.get(path="/")
 async def read_root() -> dict[str, str]:
-    return {"status": "ok"}
+    if not check_redis_connection():
+        return {
+            "status": "error",
+            "message": "Redis connection or worker status check failed",
+        }
+    workers = check_worker_status()
+    if not all(workers.values()):
+        return {
+            "status": "error",
+            "message": "Worker status check failed",
+        }
+    if len(workers["id"]) == 0:
+        return {
+            "status": "error",
+            "message": "No ID workers running",
+        }
+    if len(workers["layers"]) == 0:
+        return {
+            "status": "error",
+            "message": "No layers workers running",
+        }
+    return {
+        "status": "ok",
+        "message": f"All systems connected! ID workers: {len(workers['id'])} Layers workers: {len(workers['layers'])}",
+    }
 
 
 @app.post(path="/v1/layers")
