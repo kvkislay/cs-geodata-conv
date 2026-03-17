@@ -6,10 +6,6 @@ services:
     develop:
       watch:
         - action: rebuild
-          path: pyproject.toml
-        - action: rebuild
-          path: sysconf.ini
-        - action: sync+restart
           path: .
           target: /app
   app:
