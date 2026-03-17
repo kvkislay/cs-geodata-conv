@@ -10,11 +10,18 @@ def handle_id(request: IDConversionRequest) -> dict:
     tid = iq.enqueue(id_conversion, request)
     return {
         "task_id": tid.id,
-        "status": tid._status,
+        "status": tid.get_status().name,
     }
 
 
 def id_conversion(request: IDConversionRequest) -> None:
-    logger.info("Converting ids to a different format")
+    match request.type:
+        case "mws":
+            conv_algo_mws(request)
+        case _:
+            raise ValueError("Unsupported type")
+
+
+def conv_algo_mws(request: IDConversionRequest) -> None:
     sim_work()
     logger.info(request.model_dump())

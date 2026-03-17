@@ -10,11 +10,37 @@ def handle_layers(request: LayerConversionRequest) -> dict:
     tid = lq.enqueue(layer_conversion, request)
     return {
         "task_id": tid.id,
-        "status": tid._status,
+        "status": tid.get_status().name,
     }
 
 
 def layer_conversion(request: LayerConversionRequest) -> None:
-    logger.info("Converting layers to a different format")
+    try:
+        match request.hierarchy:
+            case "mws":
+                conv_algo_mws(request)
+            case _:
+                raise ValueError(f"Unsupported hierarchy: {request.hierarchy}")
+    except Exception as e:
+        logger.error(f"Error in layer conversion: {e}")
+        raise
+
+
+def conv_algo_mws(request: LayerConversionRequest) -> None:
+    match request.resolution:
+        case "fortnightly":
+            create_fortnightly()
+        case "annual":
+            create_annual()
+        case _:
+            raise ValueError("Unsupported resolution")
+
+
+def create_fortnightly() -> None:
     sim_work()
-    logger.info(request.model_dump())
+    logger.info("Creating fortnightly")
+
+
+def create_annual() -> None:
+    sim_work()
+    logger.info("Creating annual")
