@@ -1,0 +1,2 @@
+(B) 2026-03-16 Change the configs to .env file +geodata-conv.
+(B) 2026-03-16 Write docker compose file in +geodata-conv

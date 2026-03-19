@@ -5,9 +5,7 @@ from typing import Any
 import uvicorn
 from fastapi import FastAPI
 
-from src.app.models import IDConversionRequest, LayerConversionRequest
-from src.conversion.id import handle_id
-from src.conversion.layers import handle_layers
+from src.routers.geojson import router as geojson_router
 from src.utils.checks import check_redis_connection, check_worker_status
 from src.work.work_queue import get_status
 
@@ -29,11 +27,6 @@ async def read_root() -> dict[str, str]:
             "message": "Redis connection or worker status check failed",
         }
     workers = check_worker_status()
-    if not all(workers.values()):
-        return {
-            "status": "error",
-            "message": "Worker status check failed",
-        }
     if len(workers["id"]) == 0:
         return {
             "status": "error",
@@ -50,19 +43,12 @@ async def read_root() -> dict[str, str]:
     }
 
 
-@app.post(path="/v1/layers")
-def create_layer(request: LayerConversionRequest) -> dict[str, str]:
-    return handle_layers(request)
-
-
-@app.post(path="/v1/ids")
-def create_mws(request: IDConversionRequest) -> dict[str, str]:
-    return handle_id(request)
-
-
-@app.get(path="/v1/status")
-def get_jobstatus(task_id: str) -> dict[str, str]:
+@app.get(path="api/v1/status")
+async def get_jobstatus(task_id: str) -> dict[str, str]:
     return get_status(task_id)
+
+
+app.include_router(geojson_router, prefix="/api/v1")
 
 
 if __name__ == "__main__":

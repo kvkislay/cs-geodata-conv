@@ -11,7 +11,7 @@ def handle_layers(request: LayerConversionRequest) -> dict:
     tid = lq.enqueue(layer_conversion, request)
     return {
         "task_id": tid.id,
-        "status": tid._status,
+        "status": tid.get_status().name,
     }
 
 
@@ -19,4 +19,4 @@ def layer_conversion(request: LayerConversionRequest) -> None:
     logger.info("Converting layers to a different format")
     clean_parquet.clean_parquet(request.folder_path)
     sim_work()
-    logger.info(request.model_dump())
+    logger.info("Creating annual")
