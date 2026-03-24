@@ -1,823 +1,724 @@
 """
-create_flat_parquet.py
 
-Converts a folder of geospatial JSON files into a single flat Parquet file.
+======================
+Config-driven converter: reads one JSON config file and produces a single
+flat GeoParquet (or other supported format) from a set of geospatial JSON /
+GeoJSON layer files.
 
-Expected files in the input folder (one of each pattern):
-    aquifer*.json           -> prefix: aq
-    deltaG_fortnight*.json  -> prefix: dw
-    deltaG_well_depth*.json -> prefix: df
-    *cluster*.json          -> prefix: tc
-    *intensity*.json        -> prefix: ci
-    soge*.json              -> prefix: sg
+Usage
+-----
+    python clean_parquet.py config.json
+    python clean_parquet.py          # prompts for config path
 
-Column rules applied before merging:
-    - GLOBAL columns (never prefixed, taken from the first file only):
-          mws_id, geom, area_in_ha, state
-    - id column is dropped from every file.
-    - uid column is renamed to mws_id; no layer prefix is added.
-    - Columns whose name already starts with the layer prefix are kept as-is
-      (prevents double-prefixing like df_df_2024_2025_DeltaG).
-    - All other unique columns receive the layer prefix.
-    - Aquifer split columns receive the aq_ prefix along with _min/_max suffix.
-    - The aquifer-only column "newcode43" is dropped.
-
-Final Parquet column order:
-    mws_id, geom, area_in_ha, state, <all layer-prefixed columns ...>
-
-Usage:
-    python create_flat_parquet.py
-    python create_flat_parquet.py /path/to/folder
+Can also be called programmatically:
+    from clean_parquet import run
+    run("path/to/config.json")
 """
 
 import os
 import sys
-import glob
-import re
 import json
 import duckdb
+from tqdm import tqdm
+from typing import Dict, List, Optional
 from loguru import logger
 
-
-# ---------------------------------------------------------------------------
-# FILE PATTERNS
-# Each entry: (glob_pattern, human_label, prefix)
-# ---------------------------------------------------------------------------
-FILE_PATTERNS = [
-    ("aquifer*.json", "aquifer", "aq"),
-    ("deltaG_fortnight*.json", "deltaG_fortnight", "dw"),
-    ("deltaG_well_depth*.json", "deltaG_well_depth", "df"),
-    ("*cluster*.json", "cluster", "tc"),
-    ("*intensity*.json", "intensity", "ci"),
-    ("soge*.json", "soge", "sg"),
-]
-
-# These columns are GLOBAL - kept exactly once in the output, never prefixed.
-# uid is the raw join key and is also treated as global (becomes mws_id).
-GLOBAL_COLS = {"uid", "geom", "area_in_ha", "state"}
-
-# Columns that must be dropped from every file before any processing.
-COLS_TO_DROP = {"id", "newcode43"}
-
+# Configure logger
+logger.remove()  # Remove default handler
+logger.add(
+    sys.stderr,
+    format="{time:HH:mm:ss} | {level:8} | {name}:{line} | {message}",
+    level="INFO",
+)
+logger.add("pipeline.log", rotation="10 MB", level="DEBUG")
 
 # ===========================================================================
-# SECTION 1 - SETUP
+# SECTION 1 — CONFIG
 # ===========================================================================
 
 
-def get_folder_path(passed_path=None):
-    # 1. Use the path if we passed it from the worker
-    if passed_path:
-        return passed_path
-
-    # 2. Use CLI argument if running as a script
-    if len(sys.argv) > 1:
-        return sys.argv[1]
-
-    # 3. Fallback to input only if interactive
-    return input("Enter the path to the folder: ").strip()
-
-
-def setup_output_dir(folder_path):
+def derive_prefix(layer_name: str) -> str:
     """
-    Create and return <folder_path>/parquet/ as the output directory.
-    Also return the final parquet output file path.
+    Auto-derive a short prefix from the layer label.
+    Rule:
+        No underscore in name  →  first two characters lowercased  (aquifer → aq)
+        Has underscores        →  first character of each part     (deltaG_fortnight → df)
     """
-    folder_name = os.path.basename(folder_path.rstrip("/\\"))
-    output_dir = os.path.join(folder_path, "parquet")
-    os.makedirs(output_dir, exist_ok=True)
-    output_file = os.path.join(output_dir, f"{folder_name}_clean.parquet")
-    return output_dir, output_file
+    parts = layer_name.split("_")
+    if len(parts) == 1:
+        return layer_name[:2].lower()
+    return "".join(p[0].lower() for p in parts if p)
 
 
-def init_duckdb():
-    """
-    Create a DuckDB in-memory connection with the spatial extension loaded.
-    """
+def load_config(path: str) -> dict:
+    """Load and validate the JSON config, backfilling defaults where needed."""
+    logger.info(f"Loading config from: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    _validate_and_fill(cfg)
+    logger.debug(f"Config loaded with {len(cfg['layers'])} layers")
+    return cfg
+
+
+def _validate_and_fill(cfg: dict):
+    """Raise ValueError for missing mandatory keys; backfill optional ones."""
+    mandatory = ["layers", "column_map", "common_cols", "key", "output_path"]
+    missing = [k for k in mandatory if k not in cfg]
+    if missing:
+        logger.error(f"Missing required keys: {missing}")
+        raise ValueError(f"Config is missing required keys: {missing}")
+
+    # Backfill optional top-level keys
+    cfg.setdefault("unit", "unknown")
+    cfg.setdefault("input_format", "geojson")
+    cfg.setdefault("output_format", "parquet")
+    cfg.setdefault("rename_key_to", cfg["key"])
+    cfg.setdefault("base_layer", list(cfg["layers"].keys())[0])
+    cfg.setdefault("parquet_version", 1)
+    cfg.setdefault("use_prev_mapping", False)
+
+    logger.debug(f"Base layer: {cfg['base_layer']}, Key column: {cfg['key']}")
+
+    # Backfill missing column_map entries
+    for label in cfg["layers"]:
+        cfg["column_map"].setdefault(label, {})
+        lmap = cfg["column_map"][label]
+        lmap.setdefault("drop_columns", [])
+        lmap.setdefault("rename_columns", {})
+        lmap.setdefault("column_changes", {})
+
+
+# ===========================================================================
+# SECTION 2 — DUCKDB HELPERS
+# ===========================================================================
+
+
+def init_duckdb() -> duckdb.DuckDBPyConnection:
+    logger.debug("Initializing DuckDB with spatial extension")
     con = duckdb.connect()
     con.install_extension("spatial")
     con.load_extension("spatial")
     return con
 
 
-# ===========================================================================
-# SECTION 2 - FILE DISCOVERY AND VALIDATION
-# ===========================================================================
+def get_columns(con, table: str) -> list:
+    return [r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()]
 
 
-def find_file(folder_path, pattern):
-    """
-    Return the first file path matching <folder_path>/<pattern>.
-    Raises FileNotFoundError if no match is found.
-    Warns if multiple matches exist (uses the first one).
-    """
-    matches = glob.glob(os.path.join(folder_path, pattern))
-    if not matches:
-        raise FileNotFoundError(
-            f"Required file matching '{pattern}' not found in: {folder_path}"
-        )
-    if len(matches) > 1:
-        print(
-            f"  WARNING: Multiple files match '{pattern}'. "
-            f"Using: {os.path.basename(matches[0])}"
-        )
-    return matches[0].replace("\\", "/")
-
-
-def validate_required_files(folder_path):
-    """
-    Verify that every required file pattern has at least one match.
-    Returns a dict: {label: {"path": ..., "prefix": ...}}.
-    Aborts with a clear error message if any pattern is missing.
-    """
-    print("\n--- Step 1: Validating required files ---")
-    found = {}
-    missing = []
-
-    for pattern, label, prefix in FILE_PATTERNS:
-        try:
-            path = find_file(folder_path, pattern)
-            found[label] = {"path": path, "prefix": prefix}
-            print(f"  [OK]      {label:25s} -> {os.path.basename(path)}")
-        except FileNotFoundError as exc:
-            missing.append(str(exc))
-            print(f"  [MISSING] {label}")
-
-    if missing:
-        print("\nAborting. Missing files:")
-        for m in missing:
-            print(f"  {m}")
-        sys.exit(1)
-
-    print("  All required files found.\n")
-    return found
+def get_col_type(con, table: str, col: str) -> str:
+    for row in con.execute(f"DESCRIBE {table}").fetchall():
+        if row[0] == col:
+            return row[1].upper()
+    return ""
 
 
 # ===========================================================================
-# SECTION 3 - GENERIC HELPERS
+# SECTION 3 — COLUMN-NAME UTILITIES
 # ===========================================================================
 
 
-def load_geojson_to_table(con, file_path, table_name):
+def safe_prefix(col: str, prefix: str) -> str:
     """
-    Load a GeoJSON / JSON file via ST_READ into a named DuckDB table.
+    Prepend <prefix>_ to col unless col already starts with <prefix>_.
+    Prevents double-prefixing: df_df_2024_DeltaG → df_2024_DeltaG.
     """
-    con.execute(
-        f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM ST_READ('{file_path}');"
-    )
+    return col if col.startswith(f"{prefix}_") else f"{prefix}_{col}"
 
 
-def get_table_columns(con, table_name):
+def detect_json_metrics(con, table: str, sample_col: str) -> list:
     """
-    Return a list of column names present in the given DuckDB table.
+    Read one cell of sample_col and return the metric key list it contains.
+    Works for both raw JSON strings and DuckDB STRUCT values.
+    Returns [] if detection fails.
     """
-    return con.execute(f"PRAGMA table_info({table_name})").df()["name"].tolist()
-
-
-def detect_columns_by_pattern(con, table_name, regex):
-    """
-    Return column names from <table_name> whose names match the compiled regex.
-    """
-    return [c for c in get_table_columns(con, table_name) if regex.match(c)]
-
-
-def column_type_contains(con, table_name, column_name, keyword):
-    """
-    Return True if the DuckDB type of the column contains keyword (case-insensitive).
-    """
-    for row in con.execute(f"DESCRIBE {table_name}").fetchall():
-        if row[0] == column_name:
-            return keyword.upper() in row[1].upper()
-    return False
-
-
-def detect_json_metrics(con, table_name, sample_column):
-    """
-    Inspect one cell of <sample_column> in <table_name> and return the list of
-    metric keys stored inside that JSON / struct cell.
-    Returns an empty list if detection fails.
-    """
-    sample = con.execute(
-        f'SELECT "{sample_column}" FROM {table_name} LIMIT 1'
-    ).fetchone()[0]
-
-    if sample is None:
+    row = con.execute(f'SELECT "{sample_col}" FROM {table} LIMIT 1').fetchone()
+    if not row or row[0] is None:
         return []
-    if isinstance(sample, str):
+    val = row[0]
+    if isinstance(val, str):
         try:
-            return list(json.loads(sample).keys())
-        except Exception:
+            return list(json.loads(val).keys())
+        except Exception as e:
+            logger.debug(f"Failed to parse JSON from {sample_col}: {e}")
             pass
-        result = con.execute(f"SELECT json_keys('{sample}') AS k").fetchone()
-        if result and result[0]:
-            return result[0]
-    if hasattr(sample, "keys"):
-        return list(sample.keys())
+    if hasattr(val, "keys"):  # DuckDB struct dict-like
+        return list(val.keys())
     return []
 
 
-def safe_prefix(col_name, prefix):
+def normalise_range_sql(expr: str) -> str:
     """
-    Return <prefix>_<col_name> only if col_name does not already start with
-    <prefix>_. This prevents double-prefixing like df_df_2024_2025_DeltaG.
+    Return a SQL expression that normalises all range-separator variants to a
+    single bare '-' so SPLIT_PART can reliably split on it.
+    Handles: ' - ', ' to ', 'to ', ' to', 'to'  →  '-'
     """
-    if col_name.startswith(f"{prefix}_"):
-        return col_name
-    return f"{prefix}_{col_name}"
+    no_to = f"REGEXP_REPLACE({expr}, '[ ]*to[ ]*', '-')"
+    no_spc = f"REGEXP_REPLACE({no_to}, ' *- *', '-')"
+    return no_spc
 
 
-def drop_unwanted_cols(con, src_table, out_table):
+# ===========================================================================
+# SECTION 4 — LOAD
+# ===========================================================================
+
+
+class DataLakeLoader:
     """
-    Copy <src_table> to <out_table> while silently dropping every column
-    listed in COLS_TO_DROP that actually exists in the source table.
-    Returns the list of columns kept in out_table.
+    Production-ready loader for geospatial data from local or S3.
+    Handles lazy S3 configuration, schema validation, and progress tracking.
     """
-    existing = get_table_columns(con, src_table)
-    keep = [c for c in existing if c not in COLS_TO_DROP]
-    select_sql = ", ".join([f'"{c}"' for c in keep])
-    con.execute(
-        f"CREATE OR REPLACE TABLE {out_table} AS SELECT {select_sql} FROM {src_table};"
-    )
-    dropped = [c for c in existing if c in COLS_TO_DROP]
-    if dropped:
-        print(f"    Dropped columns: {dropped}")
-    return get_table_columns(con, out_table)
 
+    def __init__(self, extensions: List[str] = None):
+        self.extensions = extensions or ["spatial"]
+        self.conn = None
+        self._s3_configured = False
 
-def apply_prefix_to_unique_cols(con, src_table, prefix, out_table):
-    """
-    Rename columns that are NOT in GLOBAL_COLS by conditionally prepending
-    <prefix>_ (skipped if the column already starts with <prefix>_).
+    def __enter__(self):
+        logger.info("Establishing DuckDB connection")
+        self.conn = duckdb.connect()
+        for ext in self.extensions:
+            logger.debug(f"Loading extension: {ext}")
+            self.conn.execute(f"INSTALL {ext}; LOAD {ext};")
+        return self
 
-    Global columns (uid, geom, area_in_ha, state) are passed through as-is.
-    uid is NOT renamed here; it is renamed to mws_id at merge time.
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.conn:
+            logger.info("Closing DuckDB connection")
+            self.conn.close()
+        if exc_type:
+            logger.exception(f"Error during pipeline execution: {exc_val}")
 
-    Returns out_table name.
-    """
-    cols = get_table_columns(con, src_table)
-    select_parts = []
+    def _configure_s3(self):
+        """Configure S3 on the connection (once per connection)."""
+        if self._s3_configured:
+            return
 
-    for col in cols:
-        if col in GLOBAL_COLS:
-            select_parts.append(f'"{col}"')
-        else:
-            new_name = safe_prefix(col, prefix)
-            if new_name != col:
-                select_parts.append(f'"{col}" AS "{new_name}"')
-            else:
-                select_parts.append(f'"{col}"')
+        logger.info("Configuring S3 support")
+        # Check if httpfs is loaded
+        loaded = self.conn.execute("""
+            SELECT COUNT(*) FROM duckdb_extensions()
+            WHERE extension_name = 'httpfs' AND loaded = true
+        """).fetchone()[0]
 
-    con.execute(
-        f"CREATE OR REPLACE TABLE {out_table} AS "
-        f"SELECT {', '.join(select_parts)} FROM {src_table};"
-    )
-    return out_table
+        if loaded == 0:
+            logger.debug("Loading httpfs extension")
+            self.conn.execute("INSTALL httpfs; LOAD httpfs;")
 
+        # Set credentials from environment
+        if os.getenv("AWS_ACCESS_KEY_ID"):
+            logger.debug("Setting AWS credentials from environment")
+            self.conn.execute(
+                f"SET s3_access_key_id='{os.getenv('AWS_ACCESS_KEY_ID')}'"
+            )
+            self.conn.execute(
+                f"SET s3_secret_access_key='{os.getenv('AWS_SECRET_ACCESS_KEY')}'"
+            )
+        if os.getenv("AWS_REGION"):
+            logger.debug(f"Setting AWS region: {os.getenv('AWS_REGION')}")
+            self.conn.execute(f"SET s3_region='{os.getenv('AWS_REGION')}'")
+        if os.getenv("AWS_ENDPOINT"):
+            logger.debug(f"Setting S3 endpoint: {os.getenv('AWS_ENDPOINT')}")
+            self.conn.execute(f"SET s3_endpoint='{os.getenv('AWS_ENDPOINT')}'")
 
-def flatten_nested_columns(con, src_table, nested_cols, metrics, prefix, out_table):
-    """
-    Expand nested JSON / STRUCT columns into individual numeric columns.
+        self._s3_configured = True
+        logger.info("S3 configuration complete")
 
-    For each column in nested_cols and each metric in metrics a new column is
-    created. The alias is built with safe_prefix to prevent double-prefixing:
-        safe_prefix("<nested_col>_<metric>", prefix)
-    e.g. for prefix="df" and col="df_2024_2025":
-        safe_prefix("df_2024_2025_DeltaG", "df") -> "df_2024_2025_DeltaG"  (no double df_)
+    def validate_schema(self, file_path: str) -> Dict:
+        """
+        Dry run to get schema without loading data.
+        Minimal data transfer - only fetches metadata.
+        """
+        fp = file_path.replace("\\", "/")
+        is_s3 = fp.startswith("s3://")
 
-    The original nested columns are excluded from the output.
-    All other columns (including global ones) are kept as-is.
+        logger.debug(f"Validating schema for: {fp}")
 
-    Returns out_table name.
-    """
-    if not nested_cols:
-        con.execute(
-            f"CREATE OR REPLACE TABLE {out_table} AS SELECT * FROM {src_table};"
+        if is_s3:
+            self._configure_s3()
+
+        # Get schema without loading data
+        result = self.conn.execute(
+            f"DESCRIBE SELECT * FROM ST_READ('{fp}') LIMIT 0"
+        ).fetchall()
+
+        schema = {
+            "columns": [row[0] for row in result],
+            "types": [row[1] for row in result],
+            "has_geometry": "geometry" in [row[0] for row in result],
+        }
+        logger.debug(
+            f"Schema: {len(schema['columns'])} columns, geometry: {schema['has_geometry']}"
         )
-        return out_table
+        return schema
 
-    sample_col = nested_cols[0]
-    is_struct = column_type_contains(con, src_table, sample_col, "STRUCT")
+    def load_layer(
+        self,
+        file_path: str,
+        table_name: str,
+        input_format: str,
+        expected_columns: Optional[List[str]] = None,
+    ) -> int:
+        """
+        Load a single layer with optional schema validation and progress tracking.
+        Returns row count.
+        """
+        fp = file_path.replace("\\", "/")
+        fmt = input_format.lower()
+        is_s3 = fp.startswith("s3://")
 
-    flat_clauses = []
-    for col in nested_cols:
-        for metric in metrics:
-            raw_alias = f"{col}_{metric}"
-            final_name = safe_prefix(raw_alias, prefix)
-            alias = f'"{final_name}"'
-            if is_struct:
-                flat_clauses.append(f'("{col}").{metric} AS {alias}')
-            else:
-                flat_clauses.append(
-                    f"CAST(json_extract(\"{col}\", '$.{metric}') AS DOUBLE) AS {alias}"
-                )
+        # Validate format
+        supported = ("geojson", "json", "shapefile", "geopackage")
+        if fmt not in supported:
+            logger.error(f"Unsupported format: {input_format}")
+            raise ValueError(
+                f"Unsupported format: '{input_format}'. Supported: {supported}"
+            )
 
-    exclude_sql = ", ".join([f'"{c}"' for c in nested_cols])
-    flat_sql = ",\n            ".join(flat_clauses)
+        logger.info(f"Loading {table_name} from: {fp[:100]}...")
 
-    con.execute(f"""
-        CREATE OR REPLACE TABLE {out_table} AS
-        SELECT
-            * EXCLUDE ({exclude_sql}),
-            {flat_sql}
-        FROM {src_table};
-    """)
+        # Configure S3 if needed
+        if is_s3:
+            self._configure_s3()
 
-    print(
-        f"    Expanded {len(nested_cols)} nested columns x "
-        f"{len(metrics)} metrics -> {len(flat_clauses)} flat columns."
-    )
-    return out_table
+        # Optional: Validate schema before loading
+        if expected_columns:
+            logger.debug(f"Validating expected columns: {expected_columns}")
+            schema = self.validate_schema(fp)
+            missing = set(expected_columns) - set(schema["columns"])
+            if missing:
+                logger.error(f"Missing expected columns: {missing}")
+                raise ValueError(f"Expected columns missing: {missing}")
+
+        # Load with progress tracking
+        with tqdm(
+            desc=f"Loading {table_name}", unit="rows", position=0, leave=True
+        ) as pbar:
+            try:
+                # Try DuckDB's native progress bar (0.10+)
+                try:
+                    logger.debug("Attempting load with native progress bar")
+                    self.conn.execute(f"""
+                        CREATE OR REPLACE TABLE {table_name} AS
+                        SELECT * FROM ST_READ('{fp}')
+                        WITH (PROGRESS_BAR = true)
+                    """)
+                except Exception:
+                    # Fallback: load and get count
+                    logger.debug("Falling back to manual progress tracking")
+                    self.conn.execute(f"""
+                        CREATE OR REPLACE TABLE {table_name} AS
+                        SELECT * FROM ST_READ('{fp}')
+                    """)
+
+                # Update progress bar
+                row_count = self.conn.execute(
+                    f"SELECT COUNT(*) FROM {table_name}"
+                ).fetchone()[0]
+                pbar.update(row_count)
+                pbar.set_postfix({"rows": f"{row_count:,}"})
+
+                logger.info(f"Loaded {table_name}: {row_count:,} rows")
+                return row_count
+
+            except Exception as e:
+                logger.exception(f"Failed to load {table_name}: {e}")
+                pbar.set_description(f" Failed loading {table_name}")
+                raise e
+
+    def load_layers_parallel(
+        self, layers: Dict[str, str], input_format: str, max_workers: int = 4
+    ) -> Dict[str, int]:
+        """
+        Load multiple layers in parallel (for in-memory database).
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        logger.info(
+            f"Loading {len(layers)} layers in parallel with {max_workers} workers"
+        )
+        results = {}
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    self.load_layer, path, f"raw_{label}", input_format
+                ): label
+                for label, path in layers.items()
+            }
+
+            for future in tqdm(
+                as_completed(futures), total=len(futures), desc="Loading layers"
+            ):
+                label = futures[future]
+                try:
+                    row_count = future.result()
+                    results[label] = row_count
+                    logger.info(f"   {label}: {row_count:,} rows")
+                except Exception as e:
+                    logger.error(f"   {label}: {e}")
+                    raise
+
+        return results
 
 
 # ===========================================================================
-# SECTION 4 - LAYER-SPECIFIC TRANSFORMATIONS
+# SECTION 5 — PER-LAYER TRANSFORM PIPELINE
 # ===========================================================================
 
-# ---------------------------------------------------------------------------
-# 4a. aquifer -> prefix: aq
-# ---------------------------------------------------------------------------
+
+def _step_drop(con, src: str, dst: str, drop_cols: list):
+    """Drop listed columns that exist in src; copy rest to dst."""
+    all_cols = get_columns(con, src)
+    dropped = [c for c in drop_cols if c in all_cols]
+    keep = [c for c in all_cols if c not in drop_cols]
+    if dropped:
+        logger.debug(f"    Dropped columns: {dropped}")
+    sel = ", ".join([f'"{c}"' for c in keep])
+    con.execute(f"CREATE OR REPLACE TABLE {dst} AS SELECT {sel} FROM {src}")
 
 
-def transform_aquifer(con, file_path, prefix="aq"):
-    """
-    Load and transform the aquifer layer.
-
-    Special operations (in addition to general rules):
-        - Drop: id, newcode43.
-        - uid kept as uid (renamed to mws_id at merge).
-        - geom, area_in_ha, state treated as global (no prefix).
-        - Split columns (range strings -> float min/max), ALL receive aq_ prefix:
-              avg_mbgl   "X-Y"      -> aq_avg_mbgl_min,   aq_avg_mbgl_max
-              m2_perday  "upto X"   -> aq_m2_per_day_max
-              m3_per_day "X to Y"   -> aq_m3_per_day_min, aq_m3_per_day_max
-              mbgl       "X - Y"    -> aq_mbgl_min,        aq_mbgl_max
-              per_cm     "X-Y"      -> aq_per_cm_min,      aq_per_cm_max
-              yeild__    "X%-Y%"    -> aq_yeild__min,      aq_yeild__max
-              zone_m     "X-Y"      -> aq_zone_m_min,      aq_zone_m_max
-        - All remaining unique columns get the aq_ prefix (with duplicate-check).
-
-    Returns the name of the final DuckDB table.
-    """
-    print(f"  Transforming: {os.path.basename(file_path)}")
-
-    p = prefix  # short alias used in the SQL strings below
-
-    # Columns that are consumed by the split logic - excluded from the generic pass
-    split_source_cols = {
-        "avg_mbgl",
-        "m2_perday",
-        "m3_per_day",
-        "mbgl",
-        "per_cm",
-        "yeild__",
-        "zone_m",
-    }
-
-    # Load raw file to inspect columns
-    raw_table = "raw_aquifer"
-    load_geojson_to_table(con, file_path, raw_table)
-
-    all_cols = get_table_columns(con, raw_table)
-
-    # Columns that are skipped in the generic unique-column pass
-    skip_in_generic = COLS_TO_DROP | GLOBAL_COLS | split_source_cols | {"uid"}
-
-    # Build SELECT parts for remaining unique columns (with safe_prefix check)
-    unique_parts = []
-    for col in all_cols:
-        if col in skip_in_generic:
-            continue
-        new_name = safe_prefix(col, prefix)
-        if new_name != col:
-            unique_parts.append(f'"{col}" AS "{new_name}"')
-        else:
-            unique_parts.append(f'"{col}"')
-
-    unique_sql = (
-        (",\n        ".join(unique_parts) + ",\n        ") if unique_parts else ""
+def _step_rename(con, src: str, dst: str, renames: dict):
+    """Rename columns per renames dict; copy to dst."""
+    all_cols = get_columns(con, src)
+    applied = {k: v for k, v in renames.items() if k in all_cols}
+    parts = [f'"{c}" AS "{renames[c]}"' if c in renames else f'"{c}"' for c in all_cols]
+    if applied:
+        logger.debug(f"    Renamed columns: {applied}")
+    con.execute(
+        f"CREATE OR REPLACE TABLE {dst} AS SELECT {', '.join(parts)} FROM {src}"
     )
 
-    # Only include global columns that actually exist in this file
-    present_globals = [c for c in ["geom", "area_in_ha", "state"] if c in all_cols]
-    globals_sql = (
-        (", ".join([f'"{c}"' for c in present_globals]) + ",")
-        if present_globals
-        else ""
+
+def _step_column_changes(
+    con, src: str, dst: str, changes: dict, prefix: str, layer_label: str
+):
+    all_cols = get_columns(con, src)
+    logger.debug(
+        f"Processing column changes for {layer_label}, {len(all_cols)} columns"
     )
 
-    out_table = "transformed_aquifer"
-    con.execute(f"""
-        CREATE OR REPLACE TABLE {out_table} AS
-        SELECT
-            uid,
-            {globals_sql}
-            {unique_sql}
-            -- avg_mbgl "X-Y" -> aq_avg_mbgl_min, aq_avg_mbgl_max
-            CAST(SPLIT_PART("avg_mbgl", '-', 1) AS FLOAT)                    AS "{p}_avg_mbgl_min",
-            CAST(SPLIT_PART("avg_mbgl", '-', 2) AS FLOAT)                    AS "{p}_avg_mbgl_max",
+    resolved = {}
+    for c in all_cols:
+        # STRATEGY: If it looks like a date or a year range, mark it for flattening
+        if "20" in c and ("-" in c or "_" in c):
+            resolved[c] = "flatten-nested"
+            logger.debug(f"    Auto-detected JSON column: {c}")
 
-            -- m2_perday "upto X" -> aq_m2_per_day_max
-            CAST(
-                REPLACE(SPLIT_PART("m2_perday", 'upto ', 2), 'upto ', '')
-            AS FLOAT)                                                          AS "{p}_m2_per_day_max",
+        # Check against your config 'changes'
+        for key, action in changes.items():
+            if key in c:
+                resolved[c] = action
+                logger.debug(f"    Config matched: {c} -> {action}")
 
-            -- m3_per_day "X to Y" -> aq_m3_per_day_min, aq_m3_per_day_max
-            CAST(SPLIT_PART("m3_per_day", ' to', 1) AS FLOAT)                AS "{p}_m3_per_day_min",
-            CAST(SPLIT_PART("m3_per_day", ' to', 2) AS FLOAT)                AS "{p}_m3_per_day_max",
-
-            -- mbgl "X - Y" -> aq_mbgl_min, aq_mbgl_max
-            CAST(SPLIT_PART("mbgl", ' -', 1) AS FLOAT)                       AS "{p}_mbgl_min",
-            CAST(SPLIT_PART("mbgl", ' -', 2) AS FLOAT)                       AS "{p}_mbgl_max",
-
-            -- per_cm "X-Y" -> aq_per_cm_min, aq_per_cm_max
-            CAST(SPLIT_PART("per_cm", '-', 1) AS FLOAT)                      AS "{p}_per_cm_min",
-            CAST(SPLIT_PART("per_cm", '-', 2) AS FLOAT)                      AS "{p}_per_cm_max",
-
-            -- yeild__ "X%-Y%" -> aq_yeild__min, aq_yeild__max
-            CAST(REPLACE(SPLIT_PART("yeild__", '-', 1), '%', '') AS FLOAT)   AS "{p}_yeild__min",
-            CAST(REPLACE(SPLIT_PART("yeild__", '-', 2), '%', '') AS FLOAT)   AS "{p}_yeild__max",
-
-            -- zone_m "X-Y" -> aq_zone_m_min, aq_zone_m_max
-            CAST(SPLIT_PART("zone_m", '-', 1) AS FLOAT)                      AS "{p}_zone_m_min",
-            CAST(SPLIT_PART("zone_m", '-', 2) AS FLOAT)                      AS "{p}_zone_m_max"
-
-        FROM ST_READ('{file_path}')
-        -- id and newcode43 are simply never selected above, so they are dropped.
-    """)
-
-    n_cols = len(get_table_columns(con, out_table))
-    print(f"    -> {n_cols} columns in transformed_aquifer")
-    return out_table
-
-
-# ---------------------------------------------------------------------------
-# 4b. deltaG_fortnight -> prefix: dw
-# ---------------------------------------------------------------------------
-
-
-def transform_deltaG_fortnight(con, file_path, prefix="dw"):
-    """
-    Load and transform the deltaG_fortnight layer.
-
-    Columns with the pattern YYYY-MM-DD contain nested JSON / STRUCT data
-    (keys: DeltaG, ET, Precipitation, RunOff, G). Each nested cell is
-    expanded into flat columns using safe_prefix to avoid double dw_:
-        dw_<YYYY-MM-DD>_DeltaG  (if column was already dw_..., kept as-is)
-
-    id is dropped. uid kept as uid. Global cols kept without prefix.
-    All other unique columns get the dw_ prefix (with duplicate-check).
-
-    Returns the name of the final DuckDB table.
-    """
-    print(f"  Transforming: {os.path.basename(file_path)}")
-
-    raw_table = "raw_dg_fortnight"
-    load_geojson_to_table(con, file_path, raw_table)
-    drop_unwanted_cols(con, raw_table, "base_dg_fortnight")
-
-    # Detect date-named columns (YYYY-MM-DD)
-    date_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-    date_cols = detect_columns_by_pattern(con, "base_dg_fortnight", date_pattern)
-    print(f"    Found {len(date_cols)} date columns.")
-
-    # Detect metrics from the first date column
+    exclude = []
+    derived = []
     metrics = ["DeltaG", "ET", "Precipitation", "RunOff", "G"]
-    if date_cols:
-        detected = detect_json_metrics(con, "base_dg_fortnight", date_cols[0])
-        if detected:
-            metrics = detected
 
-    # Expand nested date columns into flat columns
-    flatten_nested_columns(
-        con, "base_dg_fortnight", date_cols, metrics, prefix, "flat_dg_fortnight"
+    for col, action in resolved.items():
+        if action == "flatten-nested":
+            logger.info(f"    Flattening JSON column: {col}")
+            exclude.append(col)
+            for m in metrics:
+                alias = f"{col}_{m}"
+                expr = f"TRY_CAST(json_extract(\"{col}\", '$.{m}') AS DOUBLE)"
+                derived.append(f'{expr} AS "{alias}"')
+            logger.debug(f"    Created {len(metrics)} metrics for {col}")
+
+        elif action in ["split-min-max", "percentage-split"]:
+            logger.debug(f"    Splitting column: {col} with action {action}")
+            exclude.append(col)
+            base = f"{prefix}_{col}" if not col.startswith(prefix) else col
+            norm = normalise_range_sql(f'"{col}"')
+            derived += [
+                f"TRY_CAST(NULLIF(TRIM(SPLIT_PART({norm}, '-', 1)), '') AS DOUBLE) AS \"{base}_min\"",
+                f"TRY_CAST(NULLIF(TRIM(SPLIT_PART({norm}, '-', 2)), '') AS DOUBLE) AS \"{base}_max\"",
+            ]
+        elif action == "only-max":
+            logger.debug(f"    Extracting max from: {col}")
+            exclude.append(col)
+            base = f"{prefix}_{col}" if not col.startswith(prefix) else col
+            derived.append(
+                f"TRY_CAST(REGEXP_REPLACE(\"{col}\", '(?i)^up[ ]*to[ ]*', '') AS DOUBLE) "
+                f'AS "{base}_max"'
+            )
+
+    # Rebuild the table
+    unique_excl = [c for c in exclude if c in all_cols]
+    excl_clause = (
+        f"* EXCLUDE ({', '.join(f'"{c}"' for c in unique_excl)})"
+        if unique_excl
+        else "*"
+    )
+    select_sql = f"{excl_clause}, {', '.join(derived)}" if derived else excl_clause
+
+    con.execute(f"CREATE OR REPLACE TABLE {dst} AS SELECT {select_sql} FROM {src}")
+    logger.info(f"    Table {dst}: {len(derived)} derived columns")
+
+
+def _step_apply_prefix(con, src: str, dst: str, prefix: str, skip: set):
+    """
+    Prepend <prefix>_ to every column not in the skip set, using safe_prefix
+    to prevent double-prefixing.
+    """
+    parts = []
+    for col in get_columns(con, src):
+        if col in skip:
+            parts.append(f'"{col}"')
+        else:
+            new = safe_prefix(col, prefix)
+            parts.append(f'"{col}" AS "{new}"' if new != col else f'"{col}"')
+    con.execute(
+        f"CREATE OR REPLACE TABLE {dst} AS SELECT {', '.join(parts)} FROM {src}"
     )
 
-    # Apply prefix to remaining non-global columns (safe_prefix prevents double dw_)
-    out_table = "transformed_dg_fortnight"
-    apply_prefix_to_unique_cols(con, "flat_dg_fortnight", prefix, out_table)
 
-    n_cols = len(get_table_columns(con, out_table))
-    print(f"    -> {n_cols} columns in transformed_dg_fortnight")
-    return out_table
-
-
-# ---------------------------------------------------------------------------
-# 4c. deltaG_well_depth -> prefix: df
-# ---------------------------------------------------------------------------
-
-
-def transform_deltaG_well_depth(con, file_path, prefix="df"):
+def transform_layer(
+    con,
+    label: str,
+    file_path: str,
+    prefix: str,
+    layer_cfg: dict,
+    common_cols: list,
+    key_col: str,
+    input_format: str,
+    skip_load: bool = True,
+) -> str:
     """
-    Load and transform the deltaG_well_depth layer.
-
-    Columns with the pattern YYYY_YYYY (year ranges) contain nested JSON /
-    STRUCT data. Each nested cell is expanded into flat columns using
-    safe_prefix to avoid double df_:
-        df_<YYYY_YYYY>_<Metric>  (if column was already df_..., kept as-is)
-
-    id is dropped. uid kept as uid. Global cols kept without prefix.
-    All other unique columns get the df_ prefix (with duplicate-check).
-
-    Returns the name of the final DuckDB table.
+    Full single-layer pipeline.
+    If skip_load=True, assumes table 'raw_{label}' already exists.
     """
-    print(f"  Transforming: {os.path.basename(file_path)}")
+    logger.info(f"  Transforming layer: {label} (prefix={prefix})")
 
-    raw_table = "raw_dg_well_depth"
-    load_geojson_to_table(con, file_path, raw_table)
-    drop_unwanted_cols(con, raw_table, "base_dg_well_depth")
+    t_raw = f"raw_{label}" if skip_load else f"raw_{label}_tmp"
+    t_drop = f"drop_{label}"
+    t_ren = f"ren_{label}"
+    t_chg = f"chg_{label}"
+    t_out = f"out_{label}"
 
-    # Detect year-range columns YYYY_YYYY
-    year_pattern = re.compile(r"^\d{4}_\d{4}$")
-    year_cols = detect_columns_by_pattern(con, "base_dg_well_depth", year_pattern)
-    print(f"    Found {len(year_cols)} year-range columns.")
+    # Only load if skip_load is False
+    if not skip_load:
+        logger.debug(f"    Loading {label} from {file_path}")
+        fp = file_path.replace("\\", "/")
+        con.execute(f"CREATE OR REPLACE TABLE {t_raw} AS SELECT * FROM ST_READ('{fp}')")
 
-    # Detect metrics
-    metrics = ["DeltaG"]
-    if year_cols:
-        detected = detect_json_metrics(con, "base_dg_well_depth", year_cols[0])
-        if detected:
-            metrics = detected
+    logger.debug("    Dropping unwanted columns")
+    _step_drop(con, t_raw, t_drop, layer_cfg["drop_columns"])
 
-    # Expand nested year-range columns
-    flatten_nested_columns(
-        con, "base_dg_well_depth", year_cols, metrics, prefix, "flat_dg_well_depth"
-    )
+    logger.debug("    Renaming columns")
+    _step_rename(con, t_drop, t_ren, layer_cfg["rename_columns"])
 
-    out_table = "transformed_dg_well_depth"
-    apply_prefix_to_unique_cols(con, "flat_dg_well_depth", prefix, out_table)
+    logger.debug("    Applying column transformations")
+    _step_column_changes(con, t_ren, t_chg, layer_cfg["column_changes"], prefix, label)
 
-    n_cols = len(get_table_columns(con, out_table))
-    print(f"    -> {n_cols} columns in transformed_dg_well_depth")
-    return out_table
+    logger.debug("    Applying prefixes")
+    _step_apply_prefix(con, t_chg, t_out, prefix, set(common_cols) | {key_col})
 
-
-# ---------------------------------------------------------------------------
-# 4d. cluster -> prefix: tc
-# ---------------------------------------------------------------------------
-
-
-def transform_cluster(con, file_path, prefix="tc"):
-    """
-    Load and transform the cluster layer.
-
-    No column splitting needed. id is dropped. uid kept as uid.
-    Global cols kept without prefix. All other unique columns get tc_ prefix
-    (with duplicate-check via safe_prefix).
-
-    Returns the name of the final DuckDB table.
-    """
-    print(f"  Transforming: {os.path.basename(file_path)}")
-
-    raw_table = "raw_cluster"
-    load_geojson_to_table(con, file_path, raw_table)
-    drop_unwanted_cols(con, raw_table, "base_cluster")
-
-    out_table = "transformed_cluster"
-    apply_prefix_to_unique_cols(con, "base_cluster", prefix, out_table)
-
-    n_cols = len(get_table_columns(con, out_table))
-    print(f"    -> {n_cols} columns in transformed_cluster")
-    return out_table
-
-
-# ---------------------------------------------------------------------------
-# 4e. intensity -> prefix: ci
-# ---------------------------------------------------------------------------
-
-
-def transform_intensity(con, file_path, prefix="ci"):
-    """
-    Load and transform the intensity layer.
-
-    No column splitting needed. id is dropped. uid kept as uid.
-    Global cols kept without prefix. All other unique columns get ci_ prefix
-    (with duplicate-check via safe_prefix).
-
-    Returns the name of the final DuckDB table.
-    """
-    print(f"  Transforming: {os.path.basename(file_path)}")
-
-    raw_table = "raw_intensity"
-    load_geojson_to_table(con, file_path, raw_table)
-    drop_unwanted_cols(con, raw_table, "base_intensity")
-
-    out_table = "transformed_intensity"
-    apply_prefix_to_unique_cols(con, "base_intensity", prefix, out_table)
-
-    n_cols = len(get_table_columns(con, out_table))
-    print(f"    -> {n_cols} columns in transformed_intensity")
-    return out_table
-
-
-# ---------------------------------------------------------------------------
-# 4f. soge -> prefix: sg
-# ---------------------------------------------------------------------------
-
-
-def transform_soge(con, file_path, prefix="sg"):
-    """
-    Load and transform the soge layer.
-
-    No column splitting needed. id is dropped. uid kept as uid.
-    Global cols kept without prefix. All other unique columns get sg_ prefix
-    (with duplicate-check via safe_prefix).
-
-    Returns the name of the final DuckDB table.
-    """
-    print(f"  Transforming: {os.path.basename(file_path)}")
-
-    raw_table = "raw_soge"
-    load_geojson_to_table(con, file_path, raw_table)
-    drop_unwanted_cols(con, raw_table, "base_soge")
-
-    out_table = "transformed_soge"
-    apply_prefix_to_unique_cols(con, "base_soge", prefix, out_table)
-
-    n_cols = len(get_table_columns(con, out_table))
-    print(f"    -> {n_cols} columns in transformed_soge")
-    return out_table
-
-
-# ---------------------------------------------------------------------------
-# Dispatcher - map each label to its transform function
-# ---------------------------------------------------------------------------
-
-TRANSFORM_DISPATCH = {
-    "aquifer": transform_aquifer,
-    "deltaG_fortnight": transform_deltaG_fortnight,
-    "deltaG_well_depth": transform_deltaG_well_depth,
-    "cluster": transform_cluster,
-    "intensity": transform_intensity,
-    "soge": transform_soge,
-}
-
-
-def transform_all_layers(con, file_info):
-    """
-    Run the layer-specific transform for each discovered file.
-
-    file_info: dict returned by validate_required_files()
-               {label: {"path": ..., "prefix": ...}}
-
-    Returns a dict {label: duckdb_table_name}.
-    """
-    print("\n--- Step 2: Transforming each layer ---")
-    tables = {}
-    for label, info in file_info.items():
-        fn = TRANSFORM_DISPATCH[label]
-        tables[label] = fn(con, info["path"], info["prefix"])
-    return tables
+    n = len(get_columns(con, t_out))
+    logger.info(f"    → {n} columns after transform")
+    return t_out
 
 
 # ===========================================================================
-# SECTION 5 - MERGE
+# SECTION 6 — MERGE
 # ===========================================================================
 
 
-def merge_on_mws_id(con, tables, output_table="merged_data"):
+def merge_layers(
+    con, layer_tables: dict, key_col: str, rename_key_to: str, common_cols: list
+) -> str:
     """
-    INNER JOIN all transformed tables on uid, producing a final table where:
-
-        Column 1 : mws_id     (uid renamed, sourced from base table only)
-        Column 2 : geom       (global, sourced from base table only)
-        Column 3 : area_in_ha (global, sourced from base table only)
-        Column 4 : state      (global, sourced from base table only)
-        Remaining : every non-global, non-uid column from each layer table
-                    in order: aquifer -> deltaG_fortnight -> deltaG_well_depth
-                              -> cluster -> intensity -> soge
-
-    Global columns (geom, area_in_ha, state) from non-base tables are skipped
-    so each appears exactly once in the output.
-
-    Returns output_table name.
+    INNER JOIN all transformed layer tables on key_col.
     """
-    print("\n--- Step 3: Merging all layers on uid -> mws_id ---")
+    logger.info("Merging layers")
 
-    labels = list(tables.keys())
-    base_lbl = labels[0]
-    base_tbl = tables[base_lbl]
+    labels = list(layer_tables.keys())
+    logger.debug(f"Layers to merge: {labels}")
 
-    # Assign t0 .. tN aliases to each layer table
     aliases = {lbl: f"t{i}" for i, lbl in enumerate(labels)}
+    base_lbl = labels[0]
     base_alias = aliases[base_lbl]
-    base_cols = get_table_columns(con, base_tbl)
+    base_cols = get_columns(con, layer_tables[base_lbl])
 
-    # ---- SELECT clause ----
-    # First four columns are always the anchor / global ones from the base table
-    select_parts = [f'{base_alias}."uid" AS mws_id']
-    for gcol in ["geom", "area_in_ha", "state"]:
-        if gcol in base_cols:
-            select_parts.append(f'{base_alias}."{gcol}"')
+    # 1. key → renamed
+    select = [f'{base_alias}."{key_col}" AS "{rename_key_to}"']
 
-    # Then every unique (non-global, non-uid) column from each table in order
+    # 2. common cols (except key) from base table
+    for gcol in common_cols:
+        if gcol != key_col and gcol in base_cols:
+            select.append(f'{base_alias}."{gcol}"')
+
+    # 3. layer-unique cols in layer order
+    skip = set(common_cols) | {key_col}
     for lbl in labels:
         alias = aliases[lbl]
-        cols = get_table_columns(con, tables[lbl])
-        for col in cols:
-            if col in GLOBAL_COLS:  # skip uid, geom, area_in_ha, state duplicates
-                continue
-            select_parts.append(f'{alias}."{col}"')
+        for col in get_columns(con, layer_tables[lbl]):
+            if col not in skip:
+                select.append(f'{alias}."{col}"')
 
-    # ---- FROM / JOIN clause ----
-    from_clause = f"{base_tbl} {base_alias}"
+    # 4. FROM + JOINs
+    base_tbl = layer_tables[base_lbl]
+    joins = [f"{base_tbl} {base_alias}"]
     for lbl in labels[1:]:
-        tbl = tables[lbl]
+        tbl = layer_tables[lbl]
         alias = aliases[lbl]
-        from_clause += (
-            f"\n    INNER JOIN {tbl} {alias} ON {base_alias}.uid = {alias}.uid"
+        joins.append(
+            f"INNER JOIN {tbl} {alias} "
+            f'ON {base_alias}."{key_col}" = {alias}."{key_col}"'
         )
 
-    select_sql = ",\n    ".join(select_parts)
-
     con.execute(f"""
-        CREATE OR REPLACE TABLE {output_table} AS
+        CREATE OR REPLACE TABLE merged_data AS
         SELECT
-            {select_sql}
-        FROM {from_clause};
+            {(",\n    ").join(select)}
+        FROM {chr(10).join(f"    {j}" for j in joins)}
     """)
 
-    row_count = con.execute(f"SELECT COUNT(*) FROM {output_table}").fetchone()[0]
-    col_count = len(get_table_columns(con, output_table))
-    print(f"    Merged table : {row_count:,} rows x {col_count:,} columns")
-    print("    Lead columns : mws_id, geom, area_in_ha, state")
-    return output_table
+    rows = con.execute("SELECT COUNT(*) FROM merged_data").fetchone()[0]
+    cols = len(get_columns(con, "merged_data"))
+    logger.success(f"Merged: {rows:,} rows × {cols:,} columns")
+    return "merged_data"
 
 
 # ===========================================================================
-# SECTION 6 - EXPORT
+# SECTION 7 — EXPORT
 # ===========================================================================
 
 
-def export_to_parquet(con, table_name, output_file):
+def export_table(con, table: str, output_path: str, output_format: str):
     """
-    Write the DuckDB table to a single Parquet file.
+    Write the DuckDB table to the requested output format.
+    Supported: parquet, geojson.
     """
-    print("\n--- Step 4: Exporting to Parquet ---")
-    con.execute(f"COPY {table_name} TO '{output_file}' (FORMAT PARQUET);")
-    size_mb = os.path.getsize(output_file) / (1024 * 1024)
-    print(f"    Written   : {output_file}")
-    print(f"    File size : {size_mb:.2f} MB")
+    logger.info(f"Exporting to {output_format}: {output_path}")
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    out = output_path.replace("\\", "/")
+    fmt = output_format.lower()
+
+    if fmt == "parquet":
+        con.execute(f"COPY {table} TO '{out}' (FORMAT PARQUET)")
+    elif fmt == "geojson":
+        con.execute(f"COPY {table} TO '{out}' (FORMAT GDAL, DRIVER 'GeoJSON')")
+    else:
+        logger.error(f"Unsupported output format: {output_format}")
+        raise ValueError(f"Unsupported output_format: '{output_format}'")
+
+    size_mb = os.path.getsize(output_path) / (1024 * 1024)
+    logger.success(f"Written: {output_path} ({size_mb:.2f} MB)")
 
 
 # ===========================================================================
-# SECTION 7 - MAIN
+# SECTION 8 — MAIN ORCHESTRATOR
 # ===========================================================================
+
+
+def run(config_path: str) -> str:
+    logger.info(f"Starting pipeline with config: {config_path}")
+    cfg = load_config(config_path)
+
+    output_path = cfg["output_path"]
+    output_format = cfg["output_format"]
+    input_format = cfg["input_format"]
+    layers = cfg["layers"]
+    column_map = cfg["column_map"]
+    common_cols = cfg["common_cols"]
+    key_col = cfg["key"]
+    rename_key = cfg["rename_key_to"]
+    base_layer = cfg["base_layer"]
+
+    prefixes = {label: derive_prefix(label) for label in layers}
+    ordered = [base_layer] + [layer for layer in layers if layer != base_layer]
+    logger.debug(f"Layer order: {ordered}")
+
+    # Use DataLakeLoader for connection management AND loading
+    with DataLakeLoader(["spatial"]) as loader:
+        # Step 1: Validate
+        logger.info("Step 1: Validating layer files")
+        for label in ordered:
+            path = layers[label]
+            if not path.startswith("s3://") and not os.path.exists(path):
+                logger.error(f"[{label}] file not found: {path}")
+                raise FileNotFoundError(f"[{label}] file not found: {path}")
+
+            if path.startswith("s3://"):
+                try:
+                    schema = loader.validate_schema(path)
+                    logger.info(f"  [OK] {label:30s}  {len(schema['columns'])} columns")
+                except Exception as e:
+                    logger.error(f"  [FAIL] {label}: {e}")
+                    raise
+            else:
+                logger.info(f"  [OK] {label:30s}  file={os.path.basename(path)}")
+
+        # Step 2: Load layers using DataLakeLoader
+        logger.info("Step 2: Loading raw layers")
+        for label in ordered:
+            try:
+                loader.load_layer(
+                    file_path=layers[label],
+                    table_name=f"raw_{label}",
+                    input_format=input_format,
+                )
+            except Exception:
+                logger.exception(f"Failed to load {label}")
+                raise
+
+        # Step 3: Transform
+        logger.info("Step 3: Transforming layers")
+        layer_tables = {}
+        for label in ordered:
+            try:
+                layer_tables[label] = transform_layer(
+                    loader.conn,
+                    label=label,
+                    file_path=layers[label],
+                    prefix=prefixes[label],
+                    layer_cfg=column_map[label],
+                    common_cols=common_cols,
+                    key_col=key_col,
+                    input_format=input_format,
+                    skip_load=True,
+                )
+            except Exception:
+                logger.exception(f"Failed to transform {label}")
+                raise
+
+        # Step 4: Merge
+        logger.info("Step 4: Merging layers")
+        try:
+            merged = merge_layers(
+                loader.conn, layer_tables, key_col, rename_key, common_cols
+            )
+        except Exception:
+            logger.exception("Failed to merge layers")
+            raise
+
+        # Step 5: Export
+        logger.info("Step 5: Exporting")
+        try:
+            export_table(loader.conn, merged, output_path, output_format)
+        except Exception:
+            logger.exception("Failed to export")
+            raise
+
+    logger.success("Pipeline completed successfully!")
+    return output_path
 
 
 def main():
-    folder_path = get_folder_path()
+    if len(sys.argv) > 1:
+        config_path = sys.argv[1]
+    else:
+        config_path = input("Enter path to config JSON: ").strip()
 
-    if not os.path.isdir(folder_path):
-        print(f"ERROR: '{folder_path}' is not a valid directory.")
+    if not os.path.exists(config_path):
+        logger.error(f"Config not found: {config_path}")
         sys.exit(1)
 
-    output_dir, output_file = setup_output_dir(folder_path)
-    con = init_duckdb()
-
-    # 1. Validate all required files exist before any work is done
-    file_info = validate_required_files(folder_path)
-
-    # 2. Transform each layer individually
-    tables = transform_all_layers(con, file_info)
-
-    # 3. Merge all layers on uid -> mws_id
-    merged = merge_on_mws_id(con, tables)
-
-    # 4. Export to a single Parquet file
-    export_to_parquet(con, merged, output_file)
-
-    print("\nDone.")
-
-
-# ===========================================================================
-# SECTION 8 - clean_parquet
-# ===========================================================================
-
-
-def clean_parquet(manual_path=None):
-    folder_path = get_folder_path(manual_path)
-
-    if not os.path.isdir(folder_path):
-        # Use logger instead of sys.exit in a worker
-        logger.error(f"'{folder_path}' is not a valid directory.")
-        return
-
-    output_dir, output_file = setup_output_dir(folder_path)
-    con = init_duckdb()
-
-    # 1. Validate all required files exist before any work is done
-    file_info = validate_required_files(folder_path)
-
-    # 2. Transform each layer individually
-    tables = transform_all_layers(con, file_info)
-
-    # 3. Merge all layers on uid -> mws_id
-    merged = merge_on_mws_id(con, tables)
-
-    # 4. Export to a single Parquet file
-    export_to_parquet(con, merged, output_file)
-
-    print("\nDone.")
+    try:
+        run(config_path)
+    except Exception as e:
+        logger.exception(f"Pipeline failed: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -16,7 +16,18 @@ def handle_layers(request: LayerConversionRequest) -> dict:
 
 
 def layer_conversion(request: LayerConversionRequest) -> None:
-    logger.info("Converting layers to a different format")
-    clean_parquet.clean_parquet(request.folder_path)
-    sim_work()
-    logger.info("Creating annual")
+    # If request.folder_path is the string path to your config JSON:
+    config_file = request.folder_path
+
+    try:
+        logger.info(f"Starting conversion using config: {config_file}")
+
+        # Ensure clean_parquet2.run is set up to take this string path
+        clean_parquet.run(config_file)
+
+        sim_work()
+        logger.info(f"Finished processing {config_file}")
+
+    except Exception as e:
+        logger.error(f"Error in layer_conversion for {config_file}: {e}")
+        raise e
